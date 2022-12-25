@@ -68,6 +68,7 @@ import string
 import sys
 from threading import Timer
 import types
+from fake_useragent import UserAgent
 import warnings
 
 import yarl
@@ -1231,20 +1232,27 @@ class ExpiringString(collections.UserString):
     def destroy(self) -> None:
         self._destruct()
         self._timer.cancel()
-
-
-async def _get_info(session: ClientSession) -> Tuple[str, str, int]:
+async def _get_info(session: ClientSession, ua=False) -> Tuple[str, str, int]:
+    if not ua:
+        from fake_useragent import UserAgent
+        u  = UserAgent()
+        while True:
+            ua = u.random
+            if 'Win' in ua and 'Chrome' in ua and not 'Edge' in ua:break
     for _ in range(3):
         try:
-            async with session.get('https://discord-user-api.cf/api/v1/properties/web', timeout=5) as resp:
+            async with session.get('https://discord-user-api.cf/api/v1/properties/web', timeout=5, headers={'user-agent':ua}) as resp:
                 json = await resp.json()
-                return json['chrome_user_agent'], json['chrome_version'], json['client_build_number']
+                return ua, json['chrome_version'], json['client_build_number']
         except Exception:
             continue
     _log.warning('Info API down. Falling back to manual fetching...')
-    ua = await _get_user_agent(session)
+    if not ua:
+        while True:
+            ua = u.random
+            if 'Win' in ua and not 'apple' in ua.lower() and 'Chrome' in ua:break
     bn = await _get_build_number(session)
-    bv = await _get_browser_version(session)
+    bv = ua.split('Chrome/')[1].split()[0]
     return ua, bv, bn
 
 
@@ -1266,9 +1274,7 @@ async def _get_build_number(session: ClientSession) -> int:  # Thank you Discord
 async def _get_user_agent(session: ClientSession) -> str:
     """Fetches the latest Windows 10/Chrome user-agent."""
     try:
-        request = await session.request('GET', 'https://jnrbsn.github.io/user-agents/user-agents.json', timeout=7)
-        response = json.loads(await request.text())
-        return response[0]
+        return UserAgent().random
     except asyncio.TimeoutError:
         _log.critical('Could not fetch user-agent. Falling back to hardcoded value...')
         return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36'

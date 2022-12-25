@@ -48,7 +48,7 @@ import weakref
 import inspect
 from math import ceil
 
-from .errors import ClientException, InvalidData, NotFound
+from .errors import NotFound
 from .guild import CommandCounts, Guild
 from .activity import BaseActivity
 from .user import User, ClientUser
@@ -71,7 +71,8 @@ from .scheduled_event import ScheduledEvent
 from .stage_instance import StageInstance
 from .threads import Thread, ThreadMember
 from .sticker import GuildSticker
-from .settings import UserSettings, GuildSettings, ChannelSettings, TrackingSettings
+from .settings import UserSettings, GuildSettings
+from .tracking import Tracking
 from .interactions import Interaction
 from .permissions import Permissions, PermissionOverwrite
 from .member import _ClientStatus
@@ -170,14 +171,15 @@ class MemberSidebar:
         self.chunk = chunk
         self.delay = delay
         self.loop = loop
-        self.safe_override = False
 
         self.channels = [str(channel.id) for channel in (channels or self.get_channels(1 if chunk else 5))]
         self.ranges = self.get_ranges()
         self.subscribing: bool = False
-        self.buffer: List[Member] = []
-        self.exception: Optional[Exception] = None
+        self.buffer: Optional[List[Member]] = []
         self.waiters: List[asyncio.Future[Optional[List[Member]]]] = []
+
+    def __bool__(self) -> bool:
+        return self.subscribing
 
     @property
     def limit(self) -> int:
@@ -194,7 +196,7 @@ class MemberSidebar:
 
     @property
     def safe(self):
-        return self.safe_override or self.guild._member_count >= 75000
+        return self.guild._member_count >= 75000
 
     @staticmethod
     def amalgamate(original: Tuple[int, int], value: Tuple[int, int]) -> Tuple[int, int]:
@@ -205,7 +207,7 @@ class MemberSidebar:
         end = 99
         amount = self.limit
         if amount is None:
-            raise RuntimeError('Member/presence count required to compute ranges')
+            raise RuntimeError('cannot get ranges for a guild with no member/presence count')
 
         ceiling = ceil(amount / chunk) * chunk
         ranges = []
@@ -270,13 +272,16 @@ class MemberSidebar:
         return list(ret)
 
     def add_members(self, members: List[Member]) -> None:
+        if self.buffer is None:
+            return
+
         self.buffer.extend(members)
         if self.cache:
             guild = self.guild
             for member in members:
                 guild._add_member(member)
 
-    async def wait(self) -> List[Member]:
+    async def wait(self) -> Optional[List[Member]]:
         future = self.loop.create_future()
         self.waiters.append(future)
         try:
@@ -284,7 +289,7 @@ class MemberSidebar:
         finally:
             self.waiters.remove(future)
 
-    def get_future(self) -> asyncio.Future[List[Member]]:
+    def get_future(self) -> asyncio.Future[Optional[List[Member]]]:
         future = self.loop.create_future()
         self.waiters.append(future)
         return future
@@ -292,10 +297,7 @@ class MemberSidebar:
     def done(self) -> None:
         for future in self.waiters:
             if not future.done():
-                if self.exception:
-                    future.set_exception(self.exception)
-                else:
-                    future.set_result(self.buffer)
+                future.set_result(self.buffer)
 
         try:
             del self.state._scrape_requests[self.guild.id]
@@ -308,11 +310,11 @@ class MemberSidebar:
     async def wrapper(self):
         try:
             await self.scrape()
+        except RuntimeError as exc:
+            _log.warning('Member list scraping failed for %s (%s).', self.guild.id, exc)
+            self.buffer = None
         except asyncio.CancelledError:
             pass
-        except Exception as exc:
-            _log.warning('Member list scraping failed for %s (%s).', self.guild.id, exc)
-            self.exception = exc
         finally:
             self.done()
 
@@ -335,7 +337,7 @@ class MemberSidebar:
                 break
 
             if not requests:
-                raise ClientException('Failed to automatically choose channels; please specify them manually')
+                raise RuntimeError('failed to choose channels or ranges')
 
             def predicate(data):
                 return int(data['guild_id']) == guild.id and any(op['op'] == 'SYNC' for op in data['ops'])
@@ -343,22 +345,14 @@ class MemberSidebar:
             await ws.request_lazy_guild(guild.id, channels=requests)
 
             try:
-                await asyncio.wait_for(ws.wait_for('GUILD_MEMBER_LIST_UPDATE', predicate), timeout=10)
+                await asyncio.wait_for(ws.wait_for('GUILD_MEMBER_LIST_UPDATE', predicate), timeout=15)
             except asyncio.TimeoutError:
                 r = tuple(requests.values())[-1][-1]
                 if self.limit in range(r[0], r[1]) or self.limit < r[1]:
                     self.subscribing = False
                     break
                 else:
-                    if self.safe:
-                        raise InvalidData('Did not receive a response from Discord')
-
-                    # Sometimes servers require safe mode (they used to have 75k+ members)
-                    # so if we don't get a response we force safe mode and try again
-                    self.safe_override = True
-                    self.ranges = self.get_ranges()
-                    await self.scrape()
-                    return
+                    raise RuntimeError('timeout: no response from gateway')
 
             await asyncio.sleep(delay)
 
@@ -459,8 +453,7 @@ class ConnectionState:
         self.user: Optional[ClientUser] = None
         self._users: weakref.WeakValueDictionary[int, User] = weakref.WeakValueDictionary()
         self.settings: Optional[UserSettings] = None
-        self.guild_settings: Dict[Optional[int], GuildSettings] = {}
-        self.consents: Optional[TrackingSettings] = None
+        self.consents: Optional[Tracking] = None
         self.connections: Dict[str, Connection] = {}
         self.analytics_token: Optional[str] = None
         self.preferred_regions: List[str] = []
@@ -668,11 +661,14 @@ class ConnectionState:
     def private_channels(self) -> List[PrivateChannel]:
         return list(self._private_channels.values())
 
-    async def call_connect(self, channel_id: int) -> None:
-        if self.ws is None:
+    async def access_private_channel(self, channel_id: int) -> None:
+        if (ws := self.ws) is None:
             return
 
-        await self.ws.call_connect(channel_id)
+        try:
+            await ws.access_dm(channel_id)
+        except Exception as exc:
+            _log.warning('Sending ACCESS_DM failed for channel %s, (%s).', channel_id, exc)
 
     def _get_private_channel(self, channel_id: Optional[int]) -> Optional[PrivateChannel]:
         # The keys of self._private_channels are ints
@@ -794,8 +790,6 @@ class ConnectionState:
                     await asyncio.wait_for(future, timeout=10)
                 except asyncio.TimeoutError:
                     _log.warning('Timed out waiting for chunks for guild_id %s.', guild.id)
-                except (ClientException, InvalidData):
-                    pass
         except asyncio.CancelledError:
             pass
         else:
@@ -817,6 +811,7 @@ class ConnectionState:
         self.clear()
 
         data = self._ready_data
+        guild_settings = data.get('user_guild_settings', {}).get('entries', [])
 
         # Temp user parsing
         temp_users: Dict[int, UserPayload] = {int(data['user']['id']): data['user']}
@@ -832,6 +827,11 @@ class ConnectionState:
             data.get('merged_members', []),
             extra_data['merged_presences'].get('guilds', []),
         ):
+            guild_data['settings'] = utils.find(  # type: ignore # This key does not actually exist in the payload
+                lambda i: i['guild_id'] == guild_data['id'],
+                guild_settings,
+            ) or {'guild_id': guild_data['id']}
+
             for presence in merged_presences:
                 presence['user'] = {'id': presence['user_id']}  # type: ignore # :(
 
@@ -876,26 +876,22 @@ class ConnectionState:
                 self._relationships[r_id] = Relationship(state=self, data=relationship)
 
         # Private channel parsing
-        for pm in data.get('private_channels', []) + extra_data.get('lazy_private_channels', []):
+        for pm in data.get('private_channels', []):
             factory, _ = _private_channel_factory(pm['type'])
             if 'recipients' not in pm:
-                pm['recipients'] = [temp_users[int(u_id)] for u_id in pm.pop('recipient_ids')]
+                pm['recipients'] = [temp_users[int(u_id)] for u_id in pm.pop('recipient_ids')]  # type: ignore
             self._add_private_channel(factory(me=user, data=pm, state=self))  # type: ignore
 
         # Extras
         self.analytics_token = data.get('analytics_token')
         self.preferred_regions = data.get('geo_ordered_rtc_regions', ['us-central'])
         self.settings = UserSettings(data=data.get('user_settings', {}), state=self)
-        self.guild_settings = {
-            utils._get_as_snowflake(entry, 'guild_id'): GuildSettings(data=entry, state=self)
-            for entry in data.get('user_guild_settings', {}).get('entries', [])
-        }
-        self.consents = TrackingSettings(data=data.get('consents', {}), state=self)
+        self.consents = Tracking(data=data.get('consents', {}), state=self)
         self.country_code = data.get('country_code', 'US')
         self.session_type = data.get('session_type', 'normal')
         self.connections = {c['id']: Connection(state=self, data=c) for c in data.get('connected_accounts', [])}
 
-        if 'required_action' in data:
+        if 'required_action' in data:  # Locked more than likely
             self.parse_user_required_action_update(data)
 
         if 'sessions' in data:
@@ -1077,9 +1073,13 @@ class ConnectionState:
         self.dispatch('internal_settings_update', old_settings, new_settings)
 
     def parse_user_guild_settings_update(self, data) -> None:
-        guild_id = utils._get_as_snowflake(data, 'guild_id')
+        guild_id = int(data['guild_id'])
+        guild = self._get_guild(guild_id)
+        if guild is None:
+            _log.debug('USER_GUILD_SETTINGS_UPDATE referencing an unknown guild ID: %s. Discarding.', guild_id)
+            return
 
-        settings = self.guild_settings.get(guild_id)
+        settings = guild.notification_settings
         if settings is not None:
             old_settings = copy.copy(settings)
             settings._update(data)
@@ -1179,11 +1179,12 @@ class ConnectionState:
     def parse_channel_update(self, data: gw.ChannelUpdateEvent) -> None:
         channel_type = try_enum(ChannelType, data.get('type'))
         channel_id = int(data['id'])
-        if channel_type in (ChannelType.private, ChannelType.group):
+        if channel_type is ChannelType.group:
             channel = self._get_private_channel(channel_id)
             if channel is not None:
                 old_channel = copy.copy(channel)
-                channel._update(data)
+                # The channel is a GroupChannel
+                channel._update_group(data)  # type: ignore
                 self.dispatch('private_channel_update', old_channel, channel)
                 return
             else:
@@ -1701,7 +1702,7 @@ class ConnectionState:
         await ws.request_lazy_guild(guild.id, channels=requests)
 
         try:
-            await asyncio.wait_for(ws.wait_for('GUILD_MEMBER_LIST_UPDATE', predicate), timeout=10)
+            await asyncio.wait_for(ws.wait_for('GUILD_MEMBER_LIST_UPDATE', predicate), timeout=15)
         except asyncio.TimeoutError:
             pass
 
@@ -1719,7 +1720,7 @@ class ConnectionState:
         force_scraping: bool = ...,
         channels: List[abcSnowflake] = ...,
         delay: Union[int, float] = ...,
-    ) -> List[Member]:
+    ) -> Optional[List[Member]]:
         ...
 
     @overload
@@ -1732,7 +1733,7 @@ class ConnectionState:
         force_scraping: bool = ...,
         channels: List[abcSnowflake] = ...,
         delay: Union[int, float] = ...,
-    ) -> asyncio.Future[List[Member]]:
+    ) -> asyncio.Future[Optional[List[Member]]]:
         ...
 
     async def scrape_guild(
@@ -1744,12 +1745,13 @@ class ConnectionState:
         force_scraping: bool = False,
         channels: List[abcSnowflake] = MISSING,
         delay: Union[int, float] = MISSING,
-    ) -> Union[List[Member], asyncio.Future[List[Member]]]:
+    ) -> Union[Optional[List[Member]], asyncio.Future[Optional[List[Member]]]]:
         if not guild.me:
             await guild.query_members(user_ids=[self.self_id], cache=True)  # type: ignore # self_id is always present here
 
         if not force_scraping and any(
             {
+                guild.me.guild_permissions.administrator,
                 guild.me.guild_permissions.kick_members,
                 guild.me.guild_permissions.ban_members,
                 guild.me.guild_permissions.manage_roles,
@@ -1771,18 +1773,18 @@ class ConnectionState:
 
         if wait:
             return await request.wait()
-        return request.get_future()
+        return request.get_future()  # type: ignore # Honestly, I'm confused too
 
     @overload
     async def chunk_guild(
         self, guild: Guild, *, wait: Literal[True] = ..., channels: List[abcSnowflake] = ...
-    ) -> List[Member]:
+    ) -> Optional[List[Member]]:
         ...
 
     @overload
     async def chunk_guild(
         self, guild: Guild, *, wait: Literal[False] = ..., channels: List[abcSnowflake] = ...
-    ) -> asyncio.Future[List[Member]]:
+    ) -> asyncio.Future[Optional[List[Member]]]:
         ...
 
     async def chunk_guild(
@@ -1791,7 +1793,7 @@ class ConnectionState:
         *,
         wait: bool = True,
         channels: List[abcSnowflake] = MISSING,
-    ) -> Union[asyncio.Future[List[Member]], List[Member]]:
+    ) -> Union[asyncio.Future[Optional[List[Member]]], Optional[List[Member]]]:
         if not guild.me:
             await guild.query_members(user_ids=[self.self_id], cache=True)  # type: ignore # self_id is always present here
 
@@ -1814,8 +1816,6 @@ class ConnectionState:
                 await asyncio.wait_for(self.chunk_guild(guild), timeout=10)
             except asyncio.TimeoutError:
                 _log.info('Somehow timed out waiting for chunks for guild %s.', guild.id)
-            except (ClientException, InvalidData):
-                pass
 
         self._queued_guilds.pop(guild.id)
 
@@ -2237,9 +2237,7 @@ class ConnectionState:
         id = int(data['id'])
         i = self._interactions.get(id, None)
         if i is None:
-            _log.warning('INTERACTION_SUCCESS referencing an unknown interaction ID: %s. Discarding.', id)
-            return
-
+            i = Interaction(id, nonce=data['nonce'], user=self.user)  # type: ignore # self.user is always present here
         i.successful = True
         self.dispatch('interaction_finish', i)
 
@@ -2247,9 +2245,7 @@ class ConnectionState:
         id = int(data['id'])
         i = self._interactions.pop(id, None)
         if i is None:
-            _log.warning('INTERACTION_FAILED referencing an unknown interaction ID: %s. Discarding.', id)
-            return
-
+            i = Interaction(id, nonce=data['nonce'], user=self.user)  # type: ignore # self.user is always present here
         i.successful = False
         self.dispatch('interaction_finish', i)
 
@@ -2312,9 +2308,3 @@ class ConnectionState:
 
     def create_interaction_application(self, data: dict) -> InteractionApplication:
         return InteractionApplication(state=self, data=data)
-
-    def default_guild_settings(self, guild_id: Optional[int]) -> GuildSettings:
-        return GuildSettings(data={'guild_id': guild_id}, state=self)
-
-    def default_channel_settings(self, guild_id: Optional[int], channel_id: int) -> ChannelSettings:
-        return ChannelSettings(guild_id, data={'channel_id': channel_id}, state=self)

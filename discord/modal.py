@@ -23,17 +23,17 @@ DEALINGS IN THE SOFTWARE.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional, TYPE_CHECKING, Union
 
 from .components import _component_factory
 from .enums import InteractionType
-from .interactions import _wrapped_interaction
+from .errors import InvalidData
 from .mixins import Hashable
 from .utils import _generate_nonce
 
 if TYPE_CHECKING:
     from .appinfo import InteractionApplication
-    from .components import ActionRow
+    from .components import Component
     from .interactions import Interaction
 
 # fmt: off
@@ -91,7 +91,7 @@ class Modal(Hashable):
         self.nonce: Optional[Union[int, str]] = data.get('nonce')
         self.title: str = data.get('title', '')
         self.custom_id: str = data.get('custom_id', '')
-        self.components: List[ActionRow] = [_component_factory(d) for d in data.get('components', [])]  # type: ignore # Will always be rows here
+        self.components: List[Component] = [_component_factory(d) for d in data.get('components', [])]
         self.application: InteractionApplication = interaction._state.create_interaction_application(data['application'])
 
     def __str__(self) -> str:
@@ -127,12 +127,22 @@ class Modal(Hashable):
             The interaction that was created.
         """
         interaction = self.interaction
-        return await _wrapped_interaction(
-            self._state,
-            _generate_nonce(),
-            InteractionType.modal_submit,
-            None,
-            interaction.channel,
-            self.to_dict(),
-            application_id=self.application.id,
-        )
+        state = self._state
+        nonce = _generate_nonce()
+        type = InteractionType.modal_submit
+
+        state._interaction_cache[nonce] = (int(type), None, interaction.channel)
+        try:
+            await state.http.interact(
+                type, self.to_dict(), interaction.channel, nonce=nonce, application_id=self.application.id
+            )
+            i = await state.client.wait_for(
+                'interaction_finish',
+                check=lambda d: d.nonce == nonce,
+                timeout=6,
+            )
+        except TimeoutError as exc:
+            raise InvalidData('Did not receive a response from Discord') from exc
+        finally:  # Cleanup even if we failed
+            state._interaction_cache.pop(nonce, None)
+        return i

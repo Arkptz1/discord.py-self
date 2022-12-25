@@ -41,7 +41,6 @@ __all__ = (
     'UserFlags',
     'ActivityType',
     'NotificationLevel',
-    'HighlightLevel',
     'TeamMembershipState',
     'WebhookType',
     'ExpireBehaviour',
@@ -385,12 +384,6 @@ class NotificationLevel(Enum, comparable=True):
 
     def __int__(self):
         return self.value
-
-
-class HighlightLevel(Enum):
-    default = 0
-    disabled = 1
-    enabled = 2
 
 
 class AuditLogActionCategory(Enum):
@@ -885,7 +878,6 @@ class AppCommandType(Enum):
 class ConnectionType(Enum):
     battle_net = 'battlenet'
     contacts = 'contacts'
-    crunchyroll = 'crunchyroll'
     ebay = 'ebay'
     epic_games = 'epicgames'
     facebook = 'facebook'
@@ -899,7 +891,6 @@ class ConnectionType(Enum):
     spotify = 'spotify'
     skype = 'skype'
     steam = 'steam'
-    tiktok = 'tiktok'
     twitch = 'twitch'
     twitter = 'twitter'
     youtube = 'youtube'

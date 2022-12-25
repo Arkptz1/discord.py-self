@@ -39,16 +39,17 @@ from .enums import (
 )
 from .errors import ClientException, NotFound
 from .flags import PublicUserFlags, PrivateUserFlags, PremiumUsageFlags, PurchasedFlags
+from .object import Object
 from .relationship import Relationship
 from .settings import UserSettings
-from .utils import _bytes_to_base64_data, _get_as_snowflake, copy_doc, snowflake_time, MISSING
+from .utils import _bytes_to_base64_data, _get_as_snowflake, cached_slot_property, copy_doc, snowflake_time, MISSING
 
 if TYPE_CHECKING:
     from typing_extensions import Self
 
     from datetime import datetime
 
-    from .abc import T as ConnectReturn
+    from .abc import Snowflake as _Snowflake, T as ConnectReturn
     from .calls import PrivateCall
     from .channel import DMChannel
     from .client import Client
@@ -74,8 +75,6 @@ __all__ = (
 class Note:
     """Represents a Discord note.
 
-    .. versionadded:: 2.0
-
     .. container:: operations
 
         .. describe:: x == y
@@ -96,26 +95,22 @@ class Note:
 
         .. describe:: len(x)
             Returns the note's length.
-
-    Attributes
-    -----------
-    user_id: :class:`int`
-        The user ID the note is for.
     """
 
-    __slots__ = ('_state', '_note', 'user_id', '_user')
+    __slots__ = ('_state', '_note', '_user_id', '_user')
 
     def __init__(
-        self, state: ConnectionState, user_id: int, *, user: Optional[User] = None, note: Optional[str] = MISSING
+        self, state: ConnectionState, user_id: int, *, user: _Snowflake = MISSING, note: Optional[str] = MISSING
     ) -> None:
         self._state = state
-        self._note: Optional[str] = note
-        self.user_id: int = user_id
-        self._user: Optional[User] = user
+        self._user_id = user_id
+        self._note = note
+        if user is not MISSING:
+            self._user = user
 
     @property
     def note(self) -> Optional[str]:
-        """Optional[:class:`str`]: Returns the note.
+        """Returns the note.
 
         There is an alias for this called :attr:`value`.
 
@@ -130,7 +125,7 @@ class Note:
 
     @property
     def value(self) -> Optional[str]:
-        """Optional[:class:`str`]: Returns the note.
+        """Returns the note.
 
         This is an alias of :attr:`note`.
 
@@ -141,10 +136,15 @@ class Note:
         """
         return self.note
 
-    @property
-    def user(self) -> Optional[User]:
-        """Optional[:class:`User`]: Returns the :class:`User` the note belongs to."""
-        return self._user or self._state.get_user(self.user_id)
+    @cached_slot_property('_user')
+    def user(self) -> _Snowflake:
+        """:class:`~abc.Snowflake`: Returns the :class:`User` or :class:`Object` the note belongs to."""
+        user_id = self._user_id
+
+        user = self._state.get_user(user_id)
+        if user is None:
+            user = Object(user_id)
+        return user
 
     async def fetch(self) -> Optional[str]:
         """|coro|
@@ -162,7 +162,7 @@ class Note:
             The note or ``None`` if it doesn't exist.
         """
         try:
-            data = await self._state.http.get_note(self.user_id)
+            data = await self._state.http.get_note(self.user.id)
             self._note = data['note']
             return data['note']
         except NotFound:  # 404 = no note
@@ -179,7 +179,7 @@ class Note:
         HTTPException
             Changing the note failed.
         """
-        await self._state.http.set_note(self.user_id, note=note)
+        await self._state.http.set_note(self._user_id, note=note)
         self._note = note
 
     async def delete(self) -> None:
@@ -206,25 +206,32 @@ class Note:
         note = self._note
         if note is MISSING:
             raise ClientException('Note is not fetched')
-        return note or ''
+        elif note is None:
+            return ''
+        else:
+            return note
 
     def __bool__(self) -> bool:
-        return bool(str(self))
+        try:
+            return bool(self._note)
+        except TypeError:
+            return False
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Note) and self._note == other._note and self.user_id == other.user_id
+        return isinstance(other, Note) and self._note == other._note and self._user_id == other._user_id
 
     def __ne__(self, other: object) -> bool:
         if isinstance(other, Note):
-            return self._note != other._note or self.user_id != other.user_id
+            return self._note != other._note or self._user_id != other._user_id
         return True
 
     def __hash__(self) -> int:
-        return hash((self._note, self.user_id))
+        return hash((self._note, self._user_id))
 
     def __len__(self) -> int:
-        note = str(self)
-        return len(note) if note else 0
+        if note := self._note:
+            return len(note)
+        return 0
 
 
 class _UserTag:
@@ -238,7 +245,6 @@ class BaseUser(_UserTag):
         'id',
         'discriminator',
         '_avatar',
-        '_avatar_decoration',
         '_banner',
         '_accent_colour',
         'bot',
@@ -255,7 +261,6 @@ class BaseUser(_UserTag):
         system: bool
         _state: ConnectionState
         _avatar: Optional[str]
-        _avatar_decoration: Optional[str]
         _banner: Optional[str]
         _accent_colour: Optional[int]
         _public_flags: int
@@ -287,7 +292,6 @@ class BaseUser(_UserTag):
         self.id = int(data['id'])
         self.discriminator = data['discriminator']
         self._avatar = data['avatar']
-        self._avatar_decoration = data.get('avatar_decoration')
         self._banner = data.get('banner', None)
         self._accent_colour = data.get('accent_color', None)
         self._public_flags = data.get('public_flags', 0)
@@ -302,28 +306,24 @@ class BaseUser(_UserTag):
         self.id = user.id
         self.discriminator = user.discriminator
         self._avatar = user._avatar
-        self._avatar_decoration = user._avatar_decoration
         self._banner = user._banner
         self._accent_colour = user._accent_colour
-        self._public_flags = user._public_flags
         self.bot = user.bot
-        self.system = user.system
         self._state = user._state
+        self._public_flags = user._public_flags
 
         return self
 
-    def _to_minimal_user_json(self) -> UserPayload:
-        user: UserPayload = {
+    def _to_minimal_user_json(self) -> Dict[str, Any]:
+        return {
             'username': self.name,
             'id': self.id,
             'avatar': self._avatar,
-            'avatar_decoration': self._avatar_decoration,
             'discriminator': self.discriminator,
             'bot': self.bot,
             'system': self.system,
             'public_flags': self._public_flags,
         }
-        return user
 
     @property
     def voice(self) -> Optional[VoiceState]:
@@ -362,22 +362,11 @@ class BaseUser(_UserTag):
         return self.avatar or self.default_avatar
 
     @property
-    def avatar_decoration(self) -> Optional[Asset]:
-        """Optional[:class:`Asset`]: Returns an :class:`Asset` for the avatar decoration the user has.
-
-        If the user does not have a avatar decoration, ``None`` is returned.
-
-        .. versionadded:: 2.0
-        """
-        if self._avatar_decoration is not None:
-            return Asset._from_avatar_decoration(self._state, self.id, self._avatar_decoration)
-        return None
-
-    @property
     def banner(self) -> Optional[Asset]:
         """Optional[:class:`Asset`]: Returns the user's banner asset, if available.
 
         .. versionadded:: 2.0
+
 
         .. note::
             This information is only available via :meth:`Client.fetch_user`.
@@ -385,16 +374,6 @@ class BaseUser(_UserTag):
         if self._banner is None:
             return None
         return Asset._from_user_banner(self._state, self.id, self._banner)
-
-    @property
-    def display_banner(self) -> Optional[Asset]:
-        """Optional[:class:`Asset`]: Returns the user's banner asset, if available.
-
-        This is the same as :attr:`banner` and is here for compatibility.
-
-        .. versionadded:: 2.0
-        """
-        return self.banner
 
     @property
     def accent_colour(self) -> Optional[Colour]:
@@ -539,14 +518,13 @@ class ClientUser(BaseUser):
     mfa_enabled: :class:`bool`
         Specifies if the user has MFA turned on and working.
     premium_type: Optional[:class:`PremiumType`]
-        Specifies the type of premium a user has (i.e. Nitro, Nitro Classic, or Nitro Basic). Could be None if the user is not premium.
+        Specifies the type of premium a user has (i.e. Nitro or Nitro Classic). Could be None if the user is not premium.
     note: :class:`Note`
         The user's note. Not pre-fetched.
 
         .. versionadded:: 1.9
-    nsfw_allowed: Optional[:class:`bool`]
+    nsfw_allowed: :class:`bool`
         Specifies if the user should be allowed to access NSFW content.
-        If ``None``, then the user's date of birth is not known.
 
         .. versionadded:: 2.0
     """
@@ -576,7 +554,7 @@ class ClientUser(BaseUser):
         mfa_enabled: bool
         premium_type: Optional[PremiumType]
         bio: Optional[str]
-        nsfw_allowed: Optional[bool]
+        nsfw_allowed: bool
 
     def __init__(self, *, state: ConnectionState, data: UserPayload) -> None:
         self._state = state
@@ -600,8 +578,10 @@ class ClientUser(BaseUser):
         self._premium_usage_flags = data.get('premium_usage_flags', 0)
         self.mfa_enabled = data.get('mfa_enabled', False)
         self.premium_type = try_enum(PremiumType, data['premium_type']) if 'premium_type' in data else None
+        self.bio = data.get('bio')
+        self.nsfw_allowed = data.get('nsfw_allowed', False)
         self.bio = data.get('bio') or None
-        self.nsfw_allowed = data.get('nsfw_allowed')
+        self.nsfw_allowed = data.get('nsfw_allowed', False)
 
     def get_relationship(self, user_id: int) -> Optional[Relationship]:
         """Retrieves the :class:`Relationship` if applicable.
@@ -687,7 +667,6 @@ class ClientUser(BaseUser):
         *,
         username: str = MISSING,
         avatar: Optional[bytes] = MISSING,
-        avatar_decoration: Optional[bool] = MISSING,
         password: str = MISSING,
         new_password: str = MISSING,
         email: str = MISSING,
@@ -737,19 +716,14 @@ class ClientUser(BaseUser):
         avatar: Optional[:class:`bytes`]
             A :term:`py:bytes-like object` representing the image to upload.
             Could be ``None`` to denote no avatar.
-        avatar_decoration: Optional[:class:`bool`]
-            A :term:`py:bytes-like object` representing the image to upload.
-            Could be ``None`` to denote no avatar decoration.
-
-            .. versionadded:: 2.0
         banner: :class:`bytes`
             A :term:`py:bytes-like object` representing the image to upload.
             Could be ``None`` to denote no banner.
-        accent_colour: :class:`Colour`
+        accent_colour/_color: :class:`Colour`
             A :class:`Colour` object of the colour you want to set your profile to.
         bio: :class:`str`
-            Your "about me" section.
-            Could be ``None`` to represent no bio.
+            Your 'about me' section.
+            Could be ``None`` to represent no 'about me'.
         date_of_birth: :class:`datetime.datetime`
             Your date of birth. Can only ever be set once.
 
@@ -770,7 +744,7 @@ class ClientUser(BaseUser):
         """
         args: Dict[str, Any] = {}
 
-        if any(x is not MISSING for x in (new_password, email, username, discriminator)):
+        if any(x is not MISSING for x in ('new_password', 'email', 'username', 'discriminator')):
             if password is MISSING:
                 raise ValueError('Password is required')
             args['password'] = password
@@ -881,16 +855,6 @@ class ClientUser(BaseUser):
         if restricted_guilds:
             restricted_guilds = [str(x.id) for x in restricted_guilds]
             payload['restricted_guilds'] = restricted_guilds
-
-        activity_restricted_guilds = kwargs.pop('activity_restricted_guilds', None)
-        if activity_restricted_guilds:
-            activity_restricted_guilds = [str(x.id) for x in activity_restricted_guilds]
-            payload['activity_restricted_guild_ids'] = activity_restricted_guilds
-
-        activity_joining_restricted_guilds = kwargs.pop('activity_joining_restricted_guilds', None)
-        if activity_joining_restricted_guilds:
-            activity_joining_restricted_guilds = [str(x.id) for x in activity_joining_restricted_guilds]
-            payload['activity_joining_restricted_guild_ids'] = activity_joining_restricted_guilds
 
         status = kwargs.pop('status', None)
         if status:

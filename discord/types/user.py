@@ -39,7 +39,6 @@ class PartialUser(TypedDict):
 ConnectionType = Literal[
     'battlenet',
     'contacts',
-    'crunchyroll',
     'ebay',
     'epicgames',
     'facebook',
@@ -53,7 +52,6 @@ ConnectionType = Literal[
     'spotify',
     'skype',
     'steam',
-    'tiktok',
     'twitch',
     'twitter',
     'youtube',
@@ -71,18 +69,14 @@ class User(PartialUser, total=False):
     verified: bool
     email: Optional[str]
     flags: int
-    purchased_flags: int
-    premium_usage_flags: int
     premium_type: PremiumType
     public_flags: int
-    avatar_decoration: Optional[str]
     banner: Optional[str]
     accent_color: Optional[int]
     bio: str
     analytics_token: str
     phone: Optional[str]
     token: str
-    nsfw_allowed: Optional[bool]
 
 
 class PartialConnection(TypedDict):

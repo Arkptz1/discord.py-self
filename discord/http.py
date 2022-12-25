@@ -23,12 +23,14 @@ DEALINGS IN THE SOFTWARE.
 """
 
 from __future__ import annotations
-
+import ssl
+import requests
 import asyncio
 from base64 import b64encode
+from dataclasses import MISSING
 import json
 import logging
-from random import choice
+from random import choice,randint
 from typing import (
     Any,
     ClassVar,
@@ -50,7 +52,7 @@ from urllib.parse import quote as _uriquote
 import weakref
 
 import aiohttp
-
+from aiohttp.client_exceptions import ServerDisconnectedError
 from .enums import RelationshipAction, InviteType
 from .errors import HTTPException, Forbidden, NotFound, LoginFailure, DiscordServerError, CaptchaRequired
 from .file import File
@@ -338,6 +340,7 @@ class HTTPClient:
         proxy_auth: Optional[aiohttp.BasicAuth] = None,
         unsync_clock: bool = True,
         http_trace: Optional[aiohttp.TraceConfig] = None,
+        _ua=False,
         captcha_handler: Optional[CaptchaHandler] = None,
     ) -> None:
         self.loop: asyncio.AbstractEventLoop = loop
@@ -352,12 +355,11 @@ class HTTPClient:
         self.http_trace: Optional[aiohttp.TraceConfig] = http_trace
         self.use_clock: bool = not unsync_clock
         self.captcha_handler: Optional[CaptchaHandler] = captcha_handler
-
+        self._ua=_ua
         self.user_agent: str = MISSING
         self.super_properties: Dict[str, Any] = {}
         self.encoded_super_properties: str = MISSING
         self._started: bool = False
-
     def __del__(self) -> None:
         session = self.__session
         if session:
@@ -365,17 +367,17 @@ class HTTPClient:
                 session.connector._close()  # type: ignore # Handled below
             except AttributeError:
                 pass
-
-    async def startup(self) -> None:
+    async def startup(self, _ua = False) -> None:
         if self._started:
             return
-
+        ssl_context = ssl.create_default_context()
         self.__session = session = aiohttp.ClientSession(
             connector=self.connector,
             loop=self.loop,
             trace_configs=None if self.http_trace is None else [self.http_trace],
         )
-        self.user_agent, self.browser_version, self.client_build_number = ua, bv, bn = await utils._get_info(session)
+
+        self.user_agent, self.browser_version, self.client_build_number = ua, bv, bn = await utils._get_info(session, ua=self._ua)
         _log.info('Found user agent %s (%s), build number %s.', ua, bv, bn)
         self.super_properties = sp = {
             'os': 'Windows',
@@ -405,7 +407,6 @@ class HTTPClient:
     ) -> aiohttp.ClientWebSocketResponse:
         if not host:
             host = url[6:].split('?')[0].rstrip('/')  # Removes 'wss://' and the query params
-
         kwargs: Dict[str, Any] = {
             'proxy_auth': self.proxy_auth,
             'proxy': self.proxy,
@@ -433,6 +434,8 @@ class HTTPClient:
         *,
         files: Optional[Sequence[File]] = None,
         form: Optional[Iterable[Dict[str, Any]]] = None,
+        ru = False,
+        locat=None,
         **kwargs: Any,
     ) -> Any:
         bucket = route.bucket
@@ -490,7 +493,7 @@ class HTTPClient:
 
         kwargs['headers'] = headers
 
-        # Proxy support
+        #Proxy support
         if self.proxy is not None:
             kwargs['proxy'] = self.proxy
         if self.proxy_auth is not None:
@@ -503,7 +506,7 @@ class HTTPClient:
         data: Optional[Union[Dict[str, Any], str]] = None
         await lock.acquire()
         with MaybeUnlock(lock) as maybe_lock:
-            for tries in range(5):
+            for tries in range(10):
                 if files:
                     for f in files:
                         f.reset(seek=tries)
@@ -513,13 +516,14 @@ class HTTPClient:
                     form_data = aiohttp.FormData(quote_fields=False)
                     for params in form:
                         form_data.add_field(**params)
-                    kwargs['data'] = form_data
-
+                    if not kwargs['data']:
+                        kwargs['data'] = form_data
+                    kwargs['ssl'] = ssl._create_unverified_context()
                 try:
-                    async with self.__session.request(method, url, **kwargs) as response:
+                    async with aiohttp.request(method, url, **kwargs) as response:
                         _log.debug('%s %s with %s has returned %s.', method, url, kwargs.get('data'), response.status)
                         data = await json_or_text(response)
-
+                        if ru: return response.real_url
                         # Check if we have rate limit information
                         remaining = response.headers.get('X-Ratelimit-Remaining')
                         if remaining == '0' and response.status != 429:
@@ -577,6 +581,11 @@ class HTTPClient:
                         else:
                             if 'captcha_key' in data:
                                 raise CaptchaRequired(response, data)  # type: ignore # Should not be text at this point
+                            try:
+                                if data['code'] == 50035 and data['errors']['login']['_errors'][0]['code'] == 'ACCOUNT_LOGIN_VERIFICATION_EMAIL':
+                                    return 'ACCOUNT_LOGIN_VERIFICATION_EMAIL'
+                            except:
+                                pass
                             raise HTTPException(response, data)
 
                 # This is handling exceptions from the request
@@ -590,19 +599,29 @@ class HTTPClient:
                 # Captcha handling
                 except CaptchaRequired as e:
                     values = [i for i in e.json['captcha_key'] if any(value in i for value in CAPTCHA_VALUES)]
-                    if captcha_handler is None or tries == 4:
+                    if captcha_handler is None or tries == 9:
                         raise
                     elif not values:
                         raise
                     else:
                         previous = payload or {}
-                        previous['captcha_key'] = await captcha_handler.fetch_token(e.json, self.proxy, self.proxy_auth)
+                        pa = self.proxy_auth if self.proxy_auth else None
+                        pr = self.proxy
+                        if not self.proxy_auth:
+                            if '@' in self.proxy:
+                                log, pas = self.proxy.split('@')[0].split(':')[-2:]
+                                pa = aiohttp.BasicAuth(login = log, password = pas)
+                                pr = 'http://' + self.proxy.split('@')[1]
+                        previous['captcha_key'] = await captcha_handler.fetch_token(e.json, pr, pa, self.token, tries, location = locat)
                         if (rqtoken := e.json.get('captcha_rqtoken')) is not None:
                             previous['captcha_rqtoken'] = rqtoken
                         if 'nonce' in previous:
                             previous['nonce'] = utils._generate_nonce()
                         kwargs['headers']['Content-Type'] = 'application/json'
                         kwargs['data'] = utils._to_json(previous)
+                except ServerDisconnectedError:
+                    await asyncio.sleep(5)
+                    continue
 
             if response is not None:
                 # We've run out of retries, raise
@@ -643,12 +662,29 @@ class HTTPClient:
     def _token(self, token: str) -> None:
         self.token = token
         self.ack_token = None
-
+    async def mail_verify(self, url, v2= False, v3 = False, new_pass=None):
+        r = Route('GET', '/channels/')
+        r.url = url
+        tok = await self.request(r, ru=True, super_properties_to_track=True)
+        token = str(tok).split('token=')[1]
+        payload = {'token':token}
+        lct = 'авторизации ip'
+        r = Route('POST', '/auth/authorize-ip')
+        if v2:
+             lct = 'подтверждении почты'
+             r = Route('POST', '/auth/verify')
+        if v3:
+             lct = 'востановлении пароля_2(после ссылки с письма)'
+             r = Route('POST', '/auth/reset')
+             payload['password'] = new_pass
+        res = await self.request(r, json=payload, super_properties_to_track=True, locat=lct)
+        #print(f'res -- {res}')
+        return token
     def get_me(self, with_analytics_token: bool = True) -> Response[user.User]:
         params = {'with_analytics_token': str(with_analytics_token).lower()}
         return self.request(Route('GET', '/users/@me'), params=params)
 
-    async def static_login(self, token: str) -> user.User:
+    async def static_login(self, token: str, _ua=False) -> user.User:
         old_token, self.token = self.token, token
 
         if self.connector is MISSING:
@@ -657,7 +693,7 @@ class HTTPClient:
         self._global_over = asyncio.Event()
         self._global_over.set()
 
-        await self.startup()
+        await self.startup(_ua=_ua)
 
         try:
             data = await self.get_me()
@@ -697,30 +733,6 @@ class HTTPClient:
         props = ContextProperties._empty()  # {}
 
         return self.request(Route('POST', '/users/@me/channels'), json=payload, context_properties=props)
-
-    def accept_message_request(self, channel_id: Snowflake) -> Response[channel.DMChannel]:
-        payload = {
-            'consent_status': 2,
-        }
-
-        return self.request(Route('PUT', '/channels/{channel_id}/recipients/@me', channel_id=channel_id), json=payload)
-
-    def decline_message_request(self, channel_id: Snowflake) -> Response[channel.DMChannel]:
-        return self.request(Route('DELETE', '/channels/{channel_id}/recipients/@me', channel_id=channel_id))
-
-    def mark_message_request(self, channel_id: Snowflake) -> Response[channel.DMChannel]:
-        payload = {
-            'consent_status': 1,
-        }
-
-        return self.request(Route('PUT', '/channels/{channel_id}/recipients/@me', channel_id=channel_id), json=payload)
-
-    def reset_message_request(self, channel_id: Snowflake) -> Response[channel.DMChannel]:
-        payload = {
-            'consent_status': 0,
-        }
-
-        return self.request(Route('PUT', '/channels/{channel_id}/recipients/@me', channel_id=channel_id), json=payload)
 
     # Message management
 
@@ -781,10 +793,15 @@ class HTTPClient:
     def add_reaction(self, channel_id: Snowflake, message_id: Snowflake, emoji: str) -> Response[None]:
         r = Route(
             'PUT',
-            '/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me',
+            '/channels/{channel_id}/messages/{message_id}/reactions/' +f'{emoji}me',
             channel_id=channel_id,
             message_id=message_id,
-            emoji=emoji,
+        )
+        return self.request(r)
+    def add_reaction_v2(self, emoji: str) -> Response[None]:
+        r = Route(
+            'PUT',
+            emoji
         )
         return self.request(r)
 
@@ -867,6 +884,8 @@ class HTTPClient:
 
     def get_channel(self, channel_id: Snowflake) -> Response[channel.Channel]:
         return self.request(Route('GET', '/channels/{channel_id}', channel_id=channel_id))
+    def info_for_ban(self,):
+        return self.request(Route('GET', '/users/@me/library'))
 
     def logs_from(
         self,
@@ -963,6 +982,37 @@ class HTTPClient:
             payload['deaf'] = deafen
 
         return self.request(r, json=payload, reason=reason)
+    
+    async def login_by_password(
+        self,
+        login: str,
+        password: str,
+        _ua=False
+    ):
+        if not self.token:
+            if self.connector is MISSING:
+                self.connector = aiohttp.TCPConnector(loop=self.loop, limit=0)
+
+            self._global_over = asyncio.Event()
+            self._global_over.set()
+            await self.startup(_ua=_ua)
+        r = Route('POST', '/auth/login')
+        payload = {'login':login,
+                    'password':password,
+                       'undelete': False,
+                       'captcha_key': None,
+                       'login_source': None,
+                       'gift_code_sku_id': None }
+
+        return await self.request(r, json=payload, super_properties_to_track=True, locat='входе')
+
+    async def reset_pas(self, login):
+        r = Route('POST', '/auth/forgot')
+        payload = {'login':login,
+                       'captcha_key': 'null',}
+
+        return await self.request(r, json=payload, super_properties_to_track=True, locat ='восстановлении пароля')
+
 
     def edit_profile(self, payload: Dict[str, Any]) -> Response[user.User]:
         return self.request(Route('PATCH', '/users/@me'), json=payload)
@@ -1266,7 +1316,11 @@ class HTTPClient:
         params = {'with_counts': str(with_counts).lower()}
 
         return self.request(Route('GET', '/users/@me/guilds'), params=params, super_properties_to_track=True)
-
+    
+    async def change_avatar(self, base64_image):
+        return await self.request(Route('PATCH', '/users/@me'), json={'avatar':f'{base64_image}'}, super_properties_to_track=True)
+    async def change_password(self, old_password, new_password):
+        return await self.request(Route('PATCH', '/users/@me'), json={'password':old_password, 'new_password':new_password}, super_properties_to_track=True)
     def join_guild(
         self,
         guild_id: Snowflake,
@@ -1472,7 +1526,7 @@ class HTTPClient:
         return self.request(Route('GET', '/sticker-packs'), params=params)
 
     def get_sticker_pack(self, pack_id: Snowflake):
-        return self.request(Route('GET', '/sticker-packs/{pack_id}', pack_id=pack_id))
+        return self.request(Route('GET', '/sticker-packs/{pack_id}', pack_id=pack_id), auth=False)
 
     def get_all_guild_stickers(self, guild_id: Snowflake) -> Response[List[sticker.GuildSticker]]:
         return self.request(Route('GET', '/guilds/{guild_id}/stickers', guild_id=guild_id))
@@ -1597,7 +1651,7 @@ class HTTPClient:
         return self.request(Route('GET', '/guilds/{guild_id}/member-verification', guild_id=guild_id), params=params)
 
     def accept_member_verification(
-        self, guild_id: Snowflake, **payload
+        self, guild_id: Snowflake, payload
     ) -> Response[None]:  # payload is the same as the above return type
         return self.request(Route('PUT', '/guilds/{guild_id}/requests/@me', guild_id=guild_id), json=payload)
 
@@ -1745,14 +1799,8 @@ class HTTPClient:
         payload = {
             'max_age': max_age,
         }
-        props = ContextProperties._from_group_dm_invite()
 
-        return self.request(
-            Route('POST', '/channels/{channel_id}/invites', channel_id=channel_id), json=payload, context_properties=props
-        )
-
-    def create_friend_invite(self) -> Response[invite.Invite]:
-        return self.request(Route('POST', '/users/@me/invites'), json={}, context_properties=ContextProperties._empty())
+        return self.request(Route('POST', '/channels/{channel_id}/invites', channel_id=channel_id), json=payload)
 
     def get_invite(
         self,
@@ -1778,14 +1826,8 @@ class HTTPClient:
     def invites_from_channel(self, channel_id: Snowflake) -> Response[List[invite.Invite]]:
         return self.request(Route('GET', '/channels/{channel_id}/invites', channel_id=channel_id))
 
-    def get_friend_invites(self) -> Response[List[invite.Invite]]:
-        return self.request(Route('GET', '/users/@me/invites'), context_properties=ContextProperties._empty())
-
-    def delete_invite(self, invite_id: str, *, reason: Optional[str] = None) -> Response[invite.Invite]:
+    def delete_invite(self, invite_id: str, *, reason: Optional[str] = None) -> Response[None]:
         return self.request(Route('DELETE', '/invites/{invite_id}', invite_id=invite_id), reason=reason)
-
-    def delete_friend_invites(self) -> Response[List[invite.Invite]]:
-        return self.request(Route('DELETE', '/users/@me/invites'), context_properties=ContextProperties._empty())
 
     # Role management
 
@@ -2262,6 +2304,9 @@ class HTTPClient:
         params = {'with_team_applications': str(with_team_applications).lower()}
 
         return self.request(Route('GET', '/applications'), params=params, super_properties_to_track=True)
+    async def resend_verify(self) :
+
+        return await self.request(Route('POST', '/auth/verify/resend'), super_properties_to_track=True, locat='переотправке письма')
 
     def get_my_application(self, app_id: Snowflake) -> Response[appinfo.AppInfo]:
         return self.request(Route('GET', '/applications/{app_id}', app_id=app_id), super_properties_to_track=True)
@@ -2284,12 +2329,6 @@ class HTTPClient:
     def get_partial_application(self, app_id: Snowflake) -> Response[appinfo.PartialAppInfo]:
         return self.request(Route('GET', '/oauth2/applications/{app_id}/rpc', app_id=app_id))
 
-    def get_public_application(self, app_id: Snowflake) -> Response[appinfo.PartialAppInfo]:
-        return self.request(Route('GET', '/applications/{app_id}/public', app_id=app_id))
-
-    def get_public_applications(self, app_ids: Sequence[Snowflake]) -> Response[List[appinfo.PartialAppInfo]]:
-        return self.request(Route('GET', '/applications/public'), params={'application_ids': app_ids})
-
     def create_app(self, name: str):
         payload = {'name': name}
 
@@ -2311,7 +2350,62 @@ class HTTPClient:
         return self.request(
             Route('GET', '/oauth2/applications/{app_id}/allowlist', app_id=app_id), super_properties_to_track=True
         )
+    def get_authorized_apps(self):
+        return self.request(
+            Route('GET', '/oauth2/tokens'), super_properties_to_track=True
+        )
+    async def get_hashes_authorize_sessions(self):
+        from datetime import datetime as dt
+        lst = {}
+        ans_lst = []
+        resp = await self.request(
+            Route('GET', '/auth/sessions'), super_properties_to_track=True)
+        for i in resp['user_sessions']:
+            lst[i['id_hash']] = dt.fromisoformat(i['approx_last_used_time'])
+        m = max(lst.values())
+        for i in lst.keys():
+            if lst[i] < m:
+                ans_lst.append(i)
 
+        return ans_lst
+    async def remove_all_sessions(self, password:str):
+        lst_hash = await self.get_hashes_authorize_sessions()
+        if len(lst_hash) == 1:
+            return 'Эта сессия единственная'
+        await self.request(
+            Route('POST', '/auth/sessions/logout'), super_properties_to_track=True, json={'session_id_hashes':lst_hash, 'password':password})
+        return 'Успешно'
+    def delete_authorized_apps(self, app_id):
+        return self.request(
+            Route('DELETE', '/oauth2/tokens/{app_id}', app_id=app_id), super_properties_to_track=True
+        )
+    async def get_fingerprint(self,_ua=False):
+        if self.connector is MISSING:
+            self.connector = aiohttp.TCPConnector(loop=self.loop, limit=0)
+        self._global_over = asyncio.Event()
+        self._global_over.set()
+        await self.startup(_ua=_ua)
+        r = Route('GET', '/oauth2/tokens')
+        r.url ='https://discord.com/register'
+        await self.request(r)
+        r = Route('GET', '/experiments')
+        await self.request(r,params= {'with_guild_experiments':'true'}, super_properties_to_track=True)
+        await self.request(Route('GET', '/auth/location-metadata'),super_properties_to_track=True)
+        r = Route('GET', '/oauth2/tokens')
+        r.url ='https://discordapp.com/api/v6/experiments'
+        return await self.request(
+            r, super_properties_to_track=True
+        )
+    def register(self, payload:dict):
+        payload.update(
+             {"invite": 'null',
+            "consent": 'true',
+            "date_of_birth": f"{randint(1985, 2003)}-0{randint(1,9)}-0{randint(1,9)}",
+            "gift_code_sku_id": 'null',
+            "captcha_key": 'null',
+            "promotional_email_opt_in": 'false'}
+        )
+        return self.request(Route('POST', '/auth/register'), json=payload, super_properties_to_track=True)
     def create_team(self, name: str):
         payload = {'name': name}
 
@@ -2350,13 +2444,8 @@ class HTTPClient:
             super_properties_to_track=True,
         )
 
-    def botify_app(self, app_id: Snowflake) -> Response[None]:
+    def botify_app(self, app_id: Snowflake):
         return self.request(Route('POST', '/applications/{app_id}/bot', app_id=app_id), super_properties_to_track=True)
-
-    def edit_bot(self, app_id: Snowflake, payload: dict) -> Response[user.User]:
-        return self.request(
-            Route('PATCH', '/applications/{app_id}/bot', app_id=app_id), json=payload, super_properties_to_track=True
-        )
 
     def reset_secret(self, app_id: Snowflake) -> Response[appinfo.AppInfo]:
         return self.request(Route('POST', '/applications/{app_id}/reset', app_id=app_id), super_properties_to_track=True)
@@ -2425,12 +2514,6 @@ class HTTPClient:
 
     def edit_tracking(self, payload):
         return self.request(Route('POST', '/users/@me/consent'), json=payload)
-
-    def get_email_settings(self):
-        return self.request(Route('GET', '/users/@me/email-settings'))
-
-    def edit_email_settings(self, **payload):
-        return self.request(Route('PATCH', '/users/@me/email-settings'), json={'settings': payload})
 
     def mobile_report(  # Report v1
         self, guild_id: Snowflake, channel_id: Snowflake, message_id: Snowflake, reason: str

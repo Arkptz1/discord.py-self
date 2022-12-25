@@ -93,7 +93,7 @@ if TYPE_CHECKING:
     from .types.gateway import MessageReactionRemoveEvent, MessageUpdateEvent
     from .abc import Snowflake
     from .abc import GuildChannel, MessageableChannel
-    from .components import ActionRow
+    from .components import Component
     from .state import ConnectionState
     from .channel import TextChannel
     from .mentions import AllowedMentions
@@ -895,7 +895,8 @@ class PartialMessage(Hashable):
         TypeError
             The emoji parameter is invalid.
         """
-        emoji = convert_emoji_reaction(emoji)
+        if not (type(emoji) == str):
+            emoji = convert_emoji_reaction(emoji)
         await self._state.http.add_reaction(self.channel.id, self.id, emoji)
 
     async def remove_reaction(self, emoji: Union[EmojiInputType, Reaction], member: Snowflake) -> None:
@@ -1323,7 +1324,7 @@ class Message(PartialMessage, Hashable):
         self.content: str = data['content']
         self.nonce: Optional[Union[int, str]] = data.get('nonce')
         self.stickers: List[StickerItem] = [StickerItem(data=d, state=state) for d in data.get('sticker_items', [])]
-        self.components: List[ActionRow] = [_component_factory(d, self) for d in data.get('components', [])]  # type: ignore # Will always be rows here
+        self.components: List[Component] = [_component_factory(d, self) for d in data.get('components', [])]
         self.call: Optional[CallMessage] = None
 
         try:
@@ -1558,7 +1559,7 @@ class Message(PartialMessage, Hashable):
         self.call = CallMessage(message=self, **call)
 
     def _handle_components(self, components: List[ComponentPayload]):
-        self.components: List[ActionRow] = [_component_factory(d, self) for d in components]  # type: ignore # Will always be rows here
+        self.components = [_component_factory(d, self) for d in components]
 
     def _handle_interaction(self, data: MessageInteractionPayload):
         self.interaction = Interaction._from_message(self, **data)
@@ -2013,7 +2014,7 @@ class Message(PartialMessage, Hashable):
         Parameters
         ----------
         query: Optional[:class:`str`]
-            The query to search for. Specifying this limits results to 25 commands max.
+            The query to search for.
 
             This parameter is faked if ``application`` is specified.
         limit: Optional[:class:`int`]
@@ -2025,7 +2026,7 @@ class Message(PartialMessage, Hashable):
             List of up to 100 command IDs to search for. If the command doesn't exist, it won't be returned.
 
             If ``limit`` is passed alongside this parameter, this parameter will serve as a "preferred commands" list.
-            This means that the endpoint will return the found commands + up to ``limit`` more, if available.
+            This means that the endpoint will return the found commands + ``limit`` more, if available.
         application: Optional[:class:`~discord.abc.Snowflake`]
             Whether to return this application's commands. Always set to DM recipient in a private channel context.
         include_applications: :class:`bool`

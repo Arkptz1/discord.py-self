@@ -54,7 +54,7 @@ from .widget import Widget
 from .guild import Guild
 from .emoji import Emoji
 from .channel import _private_channel_factory, _threaded_channel_factory, GroupChannel, PartialMessageable
-from .enums import ActivityType, ChannelType, ConnectionLinkType, ConnectionType, Status, try_enum
+from .enums import ActivityType, ChannelType, ConnectionLinkType, ConnectionType, Status, InviteType, try_enum
 from .mentions import AllowedMentions
 from .errors import *
 from .enums import Status
@@ -88,7 +88,6 @@ if TYPE_CHECKING:
     from .message import Message
     from .member import Member
     from .voice_client import VoiceProtocol
-    from .settings import GuildSettings
     from .types.snowflake import Snowflake as _Snowflake
 
 # fmt: off
@@ -201,7 +200,7 @@ class Client:
         The websocket gateway the client is currently connected to. Could be ``None``.
     """
 
-    def __init__(self, **options: Any) -> None:
+    def __init__(self,_ua=False, **options: Any) -> None:
         self.loop: asyncio.AbstractEventLoop = _loop
         # self.ws is set in the connect method
         self.ws: DiscordWebSocket = None  # type: ignore
@@ -212,15 +211,19 @@ class Client:
         unsync_clock: bool = options.pop('assume_unsync_clock', True)
         http_trace: Optional[aiohttp.TraceConfig] = options.pop('http_trace', None)
         captcha_handler: Optional[CaptchaHandler] = options.pop('captcha_handler', None)
+        connector = options.pop('connector', None)
+        self.ua = _ua
         if captcha_handler is not None and not isinstance(captcha_handler, CaptchaHandler):
             raise TypeError(f'captcha_handler must derive from CaptchaHandler')
         self.http: HTTPClient = HTTPClient(
             self.loop,
             proxy=proxy,
+            connector=connector,
             proxy_auth=proxy_auth,
             unsync_clock=unsync_clock,
             http_trace=http_trace,
             captcha_handler=captcha_handler,
+            _ua=self.ua
         )
 
         self._handlers: Dict[str, Callable[..., None]] = {
@@ -255,9 +258,9 @@ class Client:
 
     async def __aexit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_value: Optional[BaseException],
-        traceback: Optional[TracebackType],
+        exc_type: Optional[Type[BaseException]] =None,
+        exc_value: Optional[BaseException] = None,
+        traceback: Optional[TracebackType] = None,
     ) -> None:
         if not self.is_closed():
             await self.close()
@@ -584,7 +587,20 @@ class Client:
         state.analytics_token = data.get('analytics_token', '')
         state.user = ClientUser(state=state, data=data)
         await self.setup_hook()
-
+    async def login_by_login(self, login, password):
+        if not self.http.token:
+            await self._async_setup_hook()
+            state = self._connection
+            data = await state.http.login_by_password(login, password)
+            await self.setup_hook()
+        else:data = await self.http.login_by_password(login, password)
+        return data
+    async def get_fp(self):
+        await self._async_setup_hook()
+        state = self._connection
+        data = await state.http.get_fingerprint()
+        await self.setup_hook()
+        return data
     async def connect(self, *, reconnect: bool = True) -> None:
         """|coro|
 
@@ -756,18 +772,6 @@ class Client:
     def voice_client(self) -> Optional[VoiceProtocol]:
         """Optional[:class:`.VoiceProtocol`]: Returns the :class:`.VoiceProtocol` associated with private calls, if any."""
         return self._connection._get_voice_client(self._connection.self_id)
-
-    @property
-    def notification_settings(self) -> GuildSettings:
-        """:class:`.GuildSettings`: Returns the notification settings for private channels.
-
-        If not found, an instance is created with defaults applied. This follows Discord behaviour.
-
-        .. versionadded:: 2.0
-        """
-        # The private channel pseudo-guild settings have a guild ID of null
-        state = self._connection
-        return state.guild_settings.get(None, state.default_guild_settings(None))
 
     @property
     def initial_activity(self) -> Optional[ActivityTypes]:
@@ -1749,27 +1753,6 @@ class Client:
 
     # Invite management
 
-    async def invites(self) -> List[Invite]:
-        r"""|coro|
-
-        Gets a list of the user's friend :class:`.Invite`\s.
-
-        .. versionadded:: 2.0
-
-        Raises
-        ------
-        HTTPException
-            Getting the invites failed.
-
-        Returns
-        --------
-        List[:class:`.Invite`]
-            The list of invites.
-        """
-        state = self._connection
-        data = await state.http.get_friend_invites()
-        return [Invite.from_incomplete(state=state, data=d) for d in data]
-
     async def fetch_invite(
         self,
         url: Union[Invite, str],
@@ -1846,67 +1829,7 @@ class Client:
         )
         return Invite.from_incomplete(state=self._connection, data=data)
 
-    async def create_invite(self) -> Invite:
-        """|coro|
-
-        Creates a new friend :class:`.Invite`.
-
-        .. versionadded:: 2.0
-
-        Raises
-        ------
-        HTTPException
-            Creating the invite failed.
-
-        Returns
-        --------
-        :class:`.Invite`
-            The created friend invite.
-        """
-        state = self._connection
-        data = await state.http.create_friend_invite()
-        return Invite.from_incomplete(state=state, data=data)
-
-    async def accept_invite(self, invite: Union[Invite, str], /) -> Invite:
-        """|coro|
-
-        Uses an invite.
-        Either joins a guild, joins a group DM, or adds a friend.
-
-        .. versionadded:: 2.0
-
-        Parameters
-        ----------
-        invite: Union[:class:`.Invite`, :class:`str`]
-            The Discord invite ID, URL (must be a discord.gg URL), or :class:`.Invite`.
-
-        Raises
-        ------
-        HTTPException
-            Using the invite failed.
-
-        Returns
-        -------
-        :class:`.Invite`
-            The accepted invite.
-        """
-        if not isinstance(invite, Invite):
-            invite = await self.fetch_invite(invite, with_counts=False, with_expiration=False)
-
-        state = self._connection
-        type = invite.type
-        if message := invite._message:
-            kwargs = {'message': message}
-        else:
-            kwargs = {
-                'guild_id': getattr(invite.guild, 'id', MISSING),
-                'channel_id': getattr(invite.channel, 'id', MISSING),
-                'channel_type': getattr(invite.channel, 'type', MISSING),
-            }
-        data = await state.http.accept_invite(invite.code, type, **kwargs)
-        return Invite.from_incomplete(state=state, data=data, message=invite._message)
-
-    async def delete_invite(self, invite: Union[Invite, str], /) -> Invite:
+    async def delete_invite(self, invite: Union[Invite, str], /) -> None:
         """|coro|
 
         Revokes an :class:`.Invite`, URL, or ID to an invite.
@@ -1917,10 +1840,6 @@ class Client:
         .. versionchanged:: 2.0
 
             ``invite`` parameter is now positional-only.
-
-        .. versionchanged:: 2.0
-
-            The function now returns the deleted invite.
 
         Parameters
         ----------
@@ -1935,37 +1854,63 @@ class Client:
             The invite is invalid or expired.
         HTTPException
             Revoking the invite failed.
-
-        Returns
-        --------
-        :class:`.Invite`
-            The deleted invite.
         """
         resolved = utils.resolve_invite(invite)
-        state = self._connection
-        data = await state.http.delete_invite(resolved.code)
-        return Invite.from_incomplete(state=state, data=data)
+        await self.http.delete_invite(resolved.code)
 
-    async def revoke_invites(self) -> List[Invite]:
-        r"""|coro|
+    async def accept_invite(self, invite: Union[Invite, str], /) -> Union[Guild, User, GroupChannel]:
+        """|coro|
 
-        Revokes all of the user's friend :class:`.Invite`\s.
+        Uses an invite.
+        Either joins a guild, joins a group DM, or adds a friend.
 
-        .. versionadded:: 2.0
+        .. versionadded:: 1.9
+
+        .. versionchanged:: 2.0
+
+            ``invite`` parameter is now positional-only.
+
+        Parameters
+        ----------
+        invite: Union[:class:`.Invite`, :class:`str`]
+            The Discord invite ID, URL (must be a discord.gg URL), or :class:`.Invite`.
 
         Raises
         ------
         HTTPException
-            Revoking the invites failed.
+            Using the invite failed.
 
         Returns
-        --------
-        List[:class:`.Invite`]
-            The revoked invites.
+        -------
+        :class:`.Guild`
+            The guild joined. This is not the same guild that is
+            added to cache.
         """
+        if not isinstance(invite, Invite):
+            invite = await self.fetch_invite(invite, with_counts=False, with_expiration=False)
+
         state = self._connection
-        data = await state.http.delete_friend_invites()
-        return [Invite(state=state, data=d) for d in data]
+        type = invite.type
+        if message := invite._message:
+            kwargs = {'message': message}
+        else:
+            kwargs = {
+                'guild_id': getattr(invite.guild, 'id', MISSING),
+                'channel_id': getattr(invite.channel, 'id', MISSING),
+                'channel_type': getattr(invite.channel, 'type', MISSING),
+            }
+        try:
+            data = await state.http.accept_invite(invite.code, type, **kwargs)
+        except:
+            data = await state.http.accept_invite(invite.code, type, **kwargs)
+        if type is InviteType.guild:
+            guild = Guild(data=data['guild'], state=state)
+            guild._cs_joined = True
+            return guild
+        elif type is InviteType.group_dm:
+            return GroupChannel(data=data['channel'], state=state, me=state.user)  # type: ignore
+        else:
+            return User(data=data['inviter'], state=state)
 
     # Miscellaneous stuff
 
@@ -2015,7 +1960,7 @@ class Client:
 
         .. warning::
 
-            This API route is not well-used by the Discord client and may increase your chances at getting detected.
+            This API route is not used by the Discord client and may increase your chances at getting detected.
             Consider :meth:`fetch_user_profile` if you share a guild/relationship with the user.
 
         .. versionchanged:: 2.0
@@ -2680,65 +2625,6 @@ class Client:
         state = self._connection
         data = await state.http.get_partial_application(app_id)
         return PartialApplication(state=state, data=data)
-
-    async def fetch_public_application(self, app_id: int, /) -> PartialApplication:
-        """|coro|
-
-        Retrieves the public application with the given ID.
-
-        .. versionadded:: 2.0
-
-        Parameters
-        -----------
-        app_id: :class:`int`
-            The ID of the public application to fetch.
-
-        Raises
-        -------
-        NotFound
-            The public application was not found.
-        HTTPException
-            Retrieving the public application failed.
-
-        Returns
-        --------
-        :class:`.PartialApplication`
-            The retrieved application.
-        """
-        state = self._connection
-        data = await state.http.get_public_application(app_id)
-        return PartialApplication(state=state, data=data)
-
-    async def fetch_public_applications(self, *app_ids: int) -> List[PartialApplication]:
-        r"""|coro|
-
-        Retrieves a list of public applications. Only found applications are returned.
-
-        .. versionadded:: 2.0
-
-        Parameters
-        -----------
-        \*app_ids: :class:`int`
-            The IDs of the public applications to fetch.
-
-        Raises
-        -------
-        TypeError
-            Less than 1 ID was passed.
-        HTTPException
-            Retrieving the applications failed.
-
-        Returns
-        -------
-        List[:class:`.PartialApplication`]
-            The public applications.
-        """
-        if not app_ids:
-            raise TypeError('fetch_public_applications() takes at least 1 argument (0 given)')
-
-        state = self._connection
-        data = await state.http.get_public_applications(app_ids)
-        return [PartialApplication(state=state, data=d) for d in data]
 
     async def teams(self) -> List[Team]:
         """|coro|

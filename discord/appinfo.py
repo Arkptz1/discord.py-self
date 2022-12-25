@@ -48,7 +48,6 @@ __all__ = (
     'ApplicationBot',
     'ApplicationCompany',
     'ApplicationExecutable',
-    'ApplicationInstallParams',
     'Application',
     'PartialApplication',
     'InteractionApplication',
@@ -62,24 +61,6 @@ class ApplicationBot(User):
 
     .. versionadded:: 2.0
 
-    .. container:: operations
-
-        .. describe:: x == y
-
-            Checks if two bots are equal.
-
-        .. describe:: x != y
-
-            Checks if two bots are not equal.
-
-        .. describe:: hash(x)
-
-            Return the bot's hash.
-
-        .. describe:: str(x)
-
-            Returns the bot's name with discriminator.
-
     Attributes
     -----------
     application: :class:`Application`
@@ -92,7 +73,7 @@ class ApplicationBot(User):
         grant flow to join.
     """
 
-    __slots__ = ('application', 'public', 'require_code_grant')
+    __slots__ = ('public', 'require_code_grant')
 
     def __init__(self, *, data, state: ConnectionState, application: Application):
         super().__init__(state=state, data=data)
@@ -100,7 +81,7 @@ class ApplicationBot(User):
         self.public: bool = data['public']
         self.require_code_grant: bool = data['require_code_grant']
 
-    async def reset_token(self) -> str:
+    async def reset_token(self) -> None:
         """|coro|
 
         Resets the bot's token.
@@ -207,12 +188,6 @@ class ApplicationExecutable:
 
     .. versionadded:: 2.0
 
-    .. container:: operations
-
-        .. describe:: str(x)
-
-            Returns the executable's name.
-
     Attributes
     -----------
     name: :class:`str`
@@ -237,53 +212,6 @@ class ApplicationExecutable:
         self.os: Literal['win32', 'linux', 'darwin'] = data['os']
         self.launcher: bool = data['is_launcher']
         self.application = application
-
-    def __repr__(self) -> str:
-        return f'<ApplicationExecutable name={self.name!r} os={self.os!r} launcher={self.launcher!r}>'
-
-    def __str__(self) -> str:
-        return self.name
-
-
-class ApplicationInstallParams:
-    """Represents an application's authorization parameters.
-
-    .. versionadded:: 2.0
-
-    .. container:: operations
-
-        .. describe:: str(x)
-
-            Returns the authorization URL.
-
-    Attributes
-    ----------
-    id: :class:`int`
-        The application's ID.
-    scopes: List[:class:`str`]
-        The list of `OAuth2 scopes <https://discord.com/developers/docs/topics/oauth2#shared-resources-oauth2-scopes>`_
-        to add the application with.
-    permissions: :class:`Permissions`
-        The permissions to grant to the added bot.
-    """
-
-    __slots__ = ('id', 'scopes', 'permissions')
-
-    def __init__(self, id: int, data: dict):
-        self.id: int = id
-        self.scopes: List[str] = data.get('scopes', [])
-        self.permissions: Permissions = Permissions(int(data.get('permissions', 0)))
-
-    def __repr__(self) -> str:
-        return f'<ApplicationInstallParams id={self.id} scopes={self.scopes!r} permissions={self.permissions!r}>'
-
-    def __str__(self) -> str:
-        return self.url
-
-    @property
-    def url(self) -> str:
-        """:class:`str`: The URL to add the application with the parameters."""
-        return utils.oauth_url(self.id, permissions=self.permissions, scopes=self.scopes)
 
 
 class PartialApplication(Hashable):
@@ -352,10 +280,6 @@ class PartialApplication(Hashable):
         A list of publishers that published the application. Only available for specific applications.
     executables: List[:class:`ApplicationExecutable`]
         A list of executables that are the application's. Only available for specific applications.
-    custom_install_url: Optional[:class:`str`]
-        The custom URL to use for authorizing the application, if specified.
-    install_params: Optional[:class:`ApplicationInstallParams`]
-        The parameters to use for authorizing the application, if specified.
     """
 
     __slots__ = (
@@ -378,14 +302,13 @@ class PartialApplication(Hashable):
         'premium_tier_level',
         'tags',
         'max_participants',
+        'install_url',
         'overlay',
         'overlay_compatibility_hook',
         'aliases',
         'developers',
         'publishers',
         'executables',
-        'custom_install_url',
-        'install_params',
     )
 
     def __init__(self, *, state: ConnectionState, data: PartialAppInfoPayload):
@@ -428,10 +351,15 @@ class PartialApplication(Hashable):
         self.overlay: bool = data.get('overlay', False)
         self.overlay_compatibility_hook: bool = data.get('overlay_compatibility_hook', False)
 
-        params = data.get('install_params')
-        self.custom_install_url: Optional[str] = data.get('custom_install_url')
-        self.install_params: Optional[ApplicationInstallParams] = (
-            ApplicationInstallParams(self.id, params) if params else None
+        install_params = data.get('install_params', {})
+        self.install_url = (
+            data.get('custom_install_url')
+            if not install_params
+            else utils.oauth_url(
+                self.id,
+                permissions=Permissions(int(install_params.get('permissions', 0))),
+                scopes=install_params.get('scopes', utils.MISSING),
+            )
         )
 
         self.public: bool = data.get(
@@ -473,34 +401,11 @@ class PartialApplication(Hashable):
         """:class:`ApplicationFlags`: The flags of this application."""
         return ApplicationFlags._from_value(self._flags)
 
-    @property
-    def install_url(self) -> Optional[str]:
-        """:class:`str`: The URL to install the application."""
-        return self.custom_install_url or self.install_params.url if self.install_params else None
-
 
 class Application(PartialApplication):
     """Represents application info for an application you own.
 
     .. versionadded:: 2.0
-
-    .. container:: operations
-
-        .. describe:: x == y
-
-            Checks if two applications are equal.
-
-        .. describe:: x != y
-
-            Checks if two applications are not equal.
-
-        .. describe:: hash(x)
-
-            Return the application's hash.
-
-        .. describe:: str(x)
-
-            Returns the application's name.
 
     Attributes
     -------------
@@ -511,9 +416,12 @@ class Application(PartialApplication):
     bot: Optional[:class:`ApplicationBot`]
         The bot attached to the application, if any.
     guild_id: Optional[:class:`int`]
-        The guild ID this application is linked to, if any.
+        If this application is a game sold on Discord,
+        this field will be the guild to which it has been linked to.
     primary_sku_id: Optional[:class:`int`]
-        The application's primary SKU ID, if any.
+        If this application is a game sold on Discord,
+        this field will be the id of the "Game SKU" that is created,
+        if it exists.
     slug: Optional[:class:`str`]
         If this application is a game sold on Discord,
         this field will be the URL slug that links to the store page.
@@ -707,37 +615,10 @@ class Application(PartialApplication):
         data = await self._state.http.reset_secret(self.id)
         return data['secret']  # type: ignore # Usually not there
 
-    async def fetch_bot(self) -> ApplicationBot:
-        """|coro|
-
-        Fetches the bot attached to this application.
-
-        Raises
-        ------
-        Forbidden
-            You do not have permissions to fetch the bot,
-            or the application does not have a bot.
-        HTTPException
-            Fetching the bot failed.
-
-        Returns
-        -------
-        :class:`ApplicationBot`
-            The bot attached to this application.
-        """
-        data = await self._state.http.edit_bot(self.id, {})
-        data['public'] = self.public  # type: ignore
-        data['require_code_grant'] = self.require_code_grant  # type: ignore
-
-        self.bot = bot = ApplicationBot(data=data, state=self._state, application=self)
-        return bot
-
-    async def create_bot(self) -> None:
+    async def create_bot(self) -> ApplicationBot:
         """|coro|
 
         Creates a bot attached to this application.
-
-        This does not fetch or cache the bot.
 
         Raises
         ------
@@ -745,8 +626,21 @@ class Application(PartialApplication):
             You do not have permissions to create bots.
         HTTPException
             Creating the bot failed.
+
+        Returns
+        -------
+        :class:`ApplicationBot`
+            The newly created bot.
         """
-        await self._state.http.botify_app(self.id)
+        state = self._state
+        data = await state.http.botify_app(self.id)
+
+        data['public'] = self.public
+        data['require_code_grant'] = self.require_code_grant
+
+        bot = ApplicationBot(data=data, state=state, application=self)
+        self.bot = bot
+        return bot
 
 
 class InteractionApplication(Hashable):
@@ -784,8 +678,6 @@ class InteractionApplication(Hashable):
         The application description.
     type: Optional[:class:`ApplicationType`]
         The type of application.
-    primary_sku_id: Optional[:class:`int`]
-        The application's primary SKU ID, if any.
     """
 
     __slots__ = (
